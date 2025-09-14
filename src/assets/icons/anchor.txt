@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" fill="none" aria-hidden="true">
+  <!-- ring -->
+  <path d="M12 3.5a1.75 1.75 0 1 1 0 3.5 1.75 1.75 0 0 1 0-3.5z"
+        stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- shaft -->
+  <path d="M12 7v6.25"
+        stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- crossbar -->
+  <path d="M8.25 11.5h7.5"
+        stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- left fluke -->
+  <path d="M5.5 16.25c1-1.5 3-2.25 6.5-2.25"
+        stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M6.4 19.25a1.25 1.25 0 0 1-1.25-1.25 1.25 1.25 0 0 1 1.25-1.25"
+        stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- right fluke -->
+  <path d="M18.5 16.25c-1-1.5-3-2.25-6.5-2.25"
+        stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M17.6 19.25a1.25 1.25 0 0 0 1.25-1.25 1.25 1.25 0 0 0-1.25-1.25"
+        stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- subtle shaft base tie -->
+  <path d="M12 12.75v1.5"
+        stroke="currentColor" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" opacity="0.9"/>
+</svg>

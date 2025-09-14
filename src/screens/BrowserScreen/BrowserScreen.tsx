@@ -4,21 +4,25 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ActivityIndicator,
   Alert,
+  Animated,
+  Easing,
   FlatList,
   Keyboard,
-  Platform,
+  NativeSyntheticEvent,
   Pressable,
+  Share,
   StyleSheet,
   Text,
   TextInput,
   TouchableOpacity,
-  View,
+  View
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import SecureWebView, { SecureWebViewHandle } from '@/components/Browser/SecureWebView';
 import { useSettings } from '@/context/SettingsContext';
 import { PersistedTab, tabsStore } from '@/services/storage/tabsStore';
+
 
 type TabModel = { id: string; url: string; title?: string };
 
@@ -33,8 +37,15 @@ export default function BrowserScreen({ route }: any) {
   const webviewRef = useRef<SecureWebViewHandle | null>(null);
   const [loading, setLoading] = useState(false);
 
+  // navigation availability
+  const [canGoBack, setCanGoBack] = useState(false);
+  const [canGoForward, setCanGoForward] = useState(false);
+
+  // progress animation
+  const progress = useRef(new Animated.Value(0)).current;
+
   // Tabs state (simple multi-tab)
-  const [tabs, setTabs] = useState<TabModel[]>([{ id: 't-1', url: initialUrl, title: 'DuckDuckGo' }]);
+  const [tabs, setTabs] = useState<TabModel[]>([{ id: 't-1', url: initialUrl, title: 'New Tab' }]);
   const [activeTabId, setActiveTabId] = useState<string>('t-1');
 
   // Load persisted tabs on mount (if not clearing on exit)
@@ -43,7 +54,7 @@ export default function BrowserScreen({ route }: any) {
     (async () => {
       if (clearOnExit) {
         if (mounted) {
-          setTabs([{ id: 't-1', url: initialUrl, title: 'DuckDuckGo' }]);
+          setTabs([{ id: 't-1', url: initialUrl, title: 'New Tab' }]);
           setActiveTabId('t-1');
           setAddress(initialUrl);
         }
@@ -58,7 +69,7 @@ export default function BrowserScreen({ route }: any) {
           setActiveTabId(mapped[0].id);
           setAddress(mapped[0].url);
         } else {
-          setTabs([{ id: 't-1', url: initialUrl, title: 'DuckDuckGo' }]);
+          setTabs([{ id: 't-1', url: initialUrl, title: 'New Tab' }]);
         }
       } catch (e) {
         console.warn('Failed to load tabs', e);
@@ -71,28 +82,17 @@ export default function BrowserScreen({ route }: any) {
   }, []);
 
   // Persist tabs (debounced) when not clearing on exit
-  const saveTimer = useRef<number | null>(null);
   useEffect(() => {
     if (clearOnExit) return;
-    if (saveTimer.current) {
-      clearTimeout(saveTimer.current);
-      saveTimer.current = null;
-    }
-    saveTimer.current = (setTimeout(async () => {
+    const timer = setTimeout(async () => {
       try {
         const toPersist: PersistedTab[] = tabs.map(t => ({ id: t.id, url: t.url, title: t.title, createdAt: Date.now() }));
         await tabsStore.setAll(toPersist);
       } catch (e) {
         console.warn('Failed to persist tabs', e);
       }
-    }, 600) as any) as unknown as number;
-
-    return () => {
-      if (saveTimer.current) {
-        clearTimeout(saveTimer.current);
-        saveTimer.current = null;
-      }
-    };
+    }, 600);
+    return () => clearTimeout(timer);
   }, [tabs, clearOnExit]);
 
   const currentTab = useMemo(() => tabs.find(t => t.id === activeTabId) ?? tabs[0], [tabs, activeTabId]);
@@ -104,7 +104,6 @@ export default function BrowserScreen({ route }: any) {
       const hh = new URL(u).hostname;
       return hh;
     } catch {
-      // fallback basic extraction
       const m = u?.replace(/^https?:\/\//i, '').split('/')[0];
       return m ?? '';
     }
@@ -135,6 +134,9 @@ export default function BrowserScreen({ route }: any) {
         if (w && typeof w.injectJavaScript === 'function') {
           const js = `window.location.href = ${JSON.stringify(uri)}; true;`;
           w.injectJavaScript(js);
+        } else if (w && typeof w.loadUrl === 'function') {
+          // some wrappers expose a loadUrl style method
+          w.loadUrl(uri);
         }
       } catch {
         // ignore if wrapper doesn't support it
@@ -165,7 +167,7 @@ export default function BrowserScreen({ route }: any) {
           setActiveTabId(fallback.id);
           setAddress(fallback.url);
         }
-        return next.length ? next : [{ id: 't-1', url: initialUrl, title: 'DuckDuckGo' }];
+        return next.length ? next : [{ id: 't-1', url: initialUrl, title: 'New Tab' }];
       });
     },
     [activeTabId, initialUrl],
@@ -191,94 +193,242 @@ export default function BrowserScreen({ route }: any) {
   const openExternal = useCallback(() => {
     const u = currentTab?.url;
     if (!u) return Alert.alert('No URL', 'There is no active URL to open externally.');
-    // For now use Linking - but keep placeholder
-    // Linking.openURL(u).catch(() => Alert.alert('Failed', 'Unable to open external browser.'));
-    Alert.alert('Open externally', `Would open: ${u}`, [{ text: 'OK' }]);
+    // Present share sheet as a friendly fallback
+    Share.share({ message: u, url: u }).catch(() => {
+      Alert.alert('Open externally', `Would open: ${u}`, [{ text: 'OK' }]);
+    });
   }, [currentTab]);
+
+  // Navigation state change hook (updates back/forward availability and title)
+  const handleNavigationStateChange = useCallback((navState: any) => {
+    // navState typically contains: url, title, canGoBack, canGoForward
+    if (!navState) return;
+    setCanGoBack(Boolean(navState.canGoBack));
+    setCanGoForward(Boolean(navState.canGoForward));
+
+    // update address to reflect real navigated URL (non-invasive)
+    if (navState.url && navState.url !== address) {
+      setAddress(navState.url);
+    }
+
+    // update tab title if available (non-destructive)
+    if (navState.title) {
+      setTabs(prev => prev.map(t => (t.id === activeTabId ? { ...t, title: navState.title } : t)));
+    }
+  }, [activeTabId, address]);
+
+  // Loading / progress handlers
+  const handleLoadStart = useCallback(() => {
+    setLoading(true);
+    // animate small initial progress
+    Animated.timing(progress, {
+      toValue: 0.12,
+      duration: 250,
+      useNativeDriver: false,
+      easing: Easing.out(Easing.quad),
+    }).start();
+  }, [progress]);
+
+  const handleLoadEnd = useCallback(() => {
+    // animate to full and fade
+    Animated.timing(progress, {
+      toValue: 1,
+      duration: 300,
+      useNativeDriver: false,
+      easing: Easing.out(Easing.quad),
+    }).start(() => {
+      // reset after a small delay so progress bar hides nicely
+      setTimeout(() => {
+        progress.setValue(0);
+        setLoading(false);
+      }, 220);
+    });
+  }, [progress]);
+
+  // If the underlying WebView supports onLoadProgress, it can call this with { nativeEvent: { progress } }
+  // --- TYPED PROGRESS EVENT: avoids 'property progress does not exist' error ---
+  const handleProgress = useCallback((evt: NativeSyntheticEvent<{ progress?: number }>) => {
+    try {
+      const p = evt.nativeEvent?.progress;
+      if (typeof p === 'number') {
+        Animated.timing(progress, {
+          toValue: Math.max(0.08, Math.min(0.98, p)),
+          duration: 120,
+          useNativeDriver: false,
+        }).start();
+      }
+    } catch {
+      // ignore
+    }
+  }, [progress]);
+
+  // Error handler
+  const handleError = useCallback((e: NativeSyntheticEvent<any>) => {
+    console.warn('WebView error', e.nativeEvent ?? e);
+  }, []);
+
+  // helper: show long press menu for a tab (keeps original close behaviour intact)
+  const onTabLongPress = useCallback((item: TabModel) => {
+    Alert.alert(item.title ?? safeHostname(item.url) ?? 'Tab', undefined, [
+      { text: 'Reload tab', onPress: () => { if (item.id === activeTabId) webviewRef.current?.reload?.(); } },
+      {
+        text: 'Duplicate tab',
+        onPress: () => {
+          const id = `t-${Date.now()}`;
+          setTabs(prev => {
+            const idx = prev.findIndex(p => p.id === item.id);
+            const next = [...prev];
+            next.splice(idx + 1, 0, { id, url: item.url, title: item.title });
+            return next;
+          });
+        },
+      },
+      { text: 'Close tab', onPress: () => closeTab(item.id), style: 'destructive' },
+      { text: 'Share', onPress: () => { Share.share({ message: item.url, url: item.url }).catch(() => {}); } },
+      { text: 'Cancel', style: 'cancel' },
+    ]);
+  }, [activeTabId, closeTab]);
+
+  // UI helpers
+  const isSecure = (u?: string) => (u ? /^https:\/\//i.test(u) : false);
+
+  // address clear action
+  const clearAddress = useCallback(() => {
+    setAddress('');
+  }, []);
+
+  // --- Extra props spread as `any` to avoid strict typing mismatch with SecureWebView wrapper ---
+  const extraWebViewProps: any = {
+    onNavigationStateChange: handleNavigationStateChange,
+    onLoadProgress: handleProgress,
+  };
 
   return (
     <View style={[styles.container, { paddingTop: insets.top }]}>
-      {/* Address Card */}
+      
+      {/* Orbot Status Panel 
       <View style={styles.topCardWrap}>
-        <View style={styles.addressCard}>
-          <View style={styles.favicon}>
-            <Text style={styles.faviconText}>{(safeHostname(currentTab?.url) || 'S').charAt(0).toUpperCase()}</Text>
-          </View>
+        <OrbotStatusPanel />
+      </View> */}
 
-          <View style={styles.addressInputWrap}>
-            <Text style={styles.addressLabel}>Address</Text>
-            <TextInput
-              style={styles.addressInput}
-              value={address}
-              onChangeText={setAddress}
-              onSubmitEditing={() => go(address)}
-              placeholder="Search or enter URL"
-              returnKeyType="go"
-              autoCapitalize="none"
-              keyboardType="url"
-              clearButtonMode="while-editing"
-              accessibilityLabel="Address input"
-            />
-          </View>
-
-          <View style={styles.addressActions}>
-            <Pressable onPress={() => webviewRef.current?.reload?.()} style={styles.iconAction}>
-              <Ionicons name="reload" size={20} color="#0a84ff" />
-            </Pressable>
-            <Pressable onPress={() => webviewRef.current?.goBack?.()} style={styles.iconAction}>
-              <Ionicons name="arrow-back" size={20} color="#334155" />
-            </Pressable>
-            <Pressable onPress={() => webviewRef.current?.goForward?.()} style={styles.iconAction}>
-              <Ionicons name="arrow-forward" size={20} color="#334155" />
-            </Pressable>
-          </View>
+      {/* Address Bar */}
+      <View style={styles.topBar}>
+        <View style={styles.navButtons}>
+          <Pressable 
+            onPress={() => webviewRef.current?.goBack?.()} 
+            style={[styles.navButton, !canGoBack && styles.disabledButton]} 
+            disabled={!canGoBack}
+          >
+            <Ionicons name="arrow-back" size={20} color={canGoBack ? '#2C3E50' : '#BDC3C7'} />
+          </Pressable>
+          
+          <Pressable 
+            onPress={() => webviewRef.current?.goForward?.()} 
+            style={[styles.navButton, !canGoForward && styles.disabledButton]} 
+            disabled={!canGoForward}
+          >
+            <Ionicons name="arrow-forward" size={20} color={canGoForward ? '#2C3E50' : '#BDC3C7'} />
+          </Pressable>
+          
+          <Pressable onPress={() => webviewRef.current?.reload?.()} style={styles.navButton}>
+            <Ionicons name="refresh" size={20} color="#2C3E50" />
+          </Pressable>
         </View>
 
-        <View style={styles.metaRow}>
-          <Text style={styles.metaLeft}>Tab {tabIndex + 1} of {tabs.length}</Text>
-          <Text style={styles.metaRight}>{safeHostname(currentTab?.url)}</Text>
+        <View style={styles.addressContainer}>
+          <View style={styles.securityIndicator}>
+            {isSecure(currentTab?.url) ? (
+              <Ionicons name="lock-closed" size={14} color="#27AE60" />
+            ) : (
+              <Ionicons name="alert-circle-outline" size={14} color="#E74C3C" />
+            )}
+          </View>
+          
+          <TextInput
+            style={styles.addressInput}
+            value={address}
+            onChangeText={setAddress}
+            onSubmitEditing={() => go(address)}
+            placeholder="Search or enter website address"
+            returnKeyType="go"
+            autoCapitalize="none"
+            keyboardType="url"
+            clearButtonMode="while-editing"
+            accessibilityLabel="Address input"
+            accessibilityHint="Enter URL or search term and press go"
+          />
+          
+          {loading ? (
+            <ActivityIndicator size="small" color="#3498DB" style={styles.loadingIndicator} />
+          ) : (
+            <Pressable onPress={openExternal} style={styles.externalButton}>
+              <Ionicons name="open-outline" size={18} color="#3498DB" />
+            </Pressable>
+          )}
         </View>
+        
+        <TouchableOpacity onPress={() => addTab()} style={styles.addTabButton}>
+          <Ionicons name="add" size={24} color="#3498DB" />
+        </TouchableOpacity>
       </View>
 
-      {/* Tabs strip (horizontal scrollable) */}
-      <View style={styles.tabStripWrap}>
-        <FlatList
-          data={tabs}
-          horizontal
-          keyExtractor={i => i.id}
-          showsHorizontalScrollIndicator={false}
-          contentContainerStyle={styles.tabList}
-          renderItem={({ item }) => {
-            const active = item.id === activeTabId;
-            return (
-              <TouchableOpacity
-                style={[styles.tabPill, active ? styles.tabPillActive : undefined]}
-                onPress={() => switchTab(item.id)}
-                onLongPress={() => closeTab(item.id)}
-                accessibilityRole="button"
-              >
-                <Text style={[styles.tabPillText, active ? styles.tabPillTextActive : undefined]} numberOfLines={1}>
-                  {item.title ?? safeHostname(item.url) ?? 'New Tab'}
-                </Text>
-                <Pressable onPress={() => closeTab(item.id)} style={styles.tabCloseBtn}>
-                  <Ionicons name="close" size={14} color={active ? '#0747A6' : '#667085'} />
-                </Pressable>
-              </TouchableOpacity>
-            );
-          }}
-          ListFooterComponent={
-            <TouchableOpacity style={styles.tabAddBtn} onPress={() => addTab()}>
-              <Ionicons name="add" size={18} color="#fff" />
-            </TouchableOpacity>
-          }
-        />
-      </View>
+      {/* Tabs strip */}
+      {tabs.length > 1 && (
+        <View style={styles.tabStrip}>
+          <FlatList
+            data={tabs}
+            horizontal
+            keyExtractor={i => i.id}
+            showsHorizontalScrollIndicator={false}
+            contentContainerStyle={styles.tabList}
+            renderItem={({ item }) => {
+              const active = item.id === activeTabId;
+              return (
+                <TouchableOpacity
+                  style={[styles.tab, active ? styles.activeTab : undefined]}
+                  onPress={() => switchTab(item.id)}
+                  onLongPress={() => onTabLongPress(item)}
+                  accessibilityRole="button"
+                  accessibilityState={{ selected: active }}
+                >
+                  <View style={styles.tabContent}>
+                    <Text style={[styles.tabTitle, active ? styles.activeTabTitle : undefined]} numberOfLines={1}>
+                      {item.title ?? safeHostname(item.url) ?? 'New Tab'}
+                    </Text>
+                    <Pressable 
+                      onPress={() => closeTab(item.id)} 
+                      style={styles.tabCloseButton}
+                      hitSlop={8}
+                    >
+                      <Ionicons name="close" size={14} color={active ? '#2C3E50' : '#7F8C8D'} />
+                    </Pressable>
+                  </View>
+                </TouchableOpacity>
+              );
+            }}
+          />
+        </View>
+      )}
 
       {/* WebView container */}
       <View style={styles.webviewContainer}>
+        {/* Progress bar */}
+        <Animated.View
+          style={[
+            styles.progressBar,
+            {
+              width: progress.interpolate({
+                inputRange: [0, 1],
+                outputRange: ['0%', '100%'],
+              }),
+              opacity: progress.interpolate({ inputRange: [0, 0.02, 0.98, 1], outputRange: [0, 1, 1, 0] }),
+            },
+          ]}
+        />
+
         {loading && (
           <View style={styles.loadingOverlay}>
-            <ActivityIndicator size="small" color="#0a84ff" />
+            <ActivityIndicator size="small" color="#3498DB" />
             <Text style={styles.loadingText}>Loading…</Text>
           </View>
         )}
@@ -288,32 +438,29 @@ export default function BrowserScreen({ route }: any) {
           uri={currentTab.url}
           style={styles.webview}
           injectedJavaScript={injectedJS}
-          onLoadStart={() => setLoading(true)}
-          onLoadEnd={() => setLoading(false)}
-          onError={(e: any) => console.warn('WebView error', e)}
+          onLoadStart={handleLoadStart}
+          onLoadEnd={handleLoadEnd}
+          onError={handleError}
+          // spread any optional handlers as `any` to avoid tight type coupling with the wrapper
+          {...extraWebViewProps}
         />
       </View>
 
-      {/* Bottom toolbar */}
+      {/* Bottom action bar */}
       <View style={styles.bottomBar}>
-        <Pressable onPress={() => webviewRef.current?.goBack?.()} style={styles.bottomBtn}>
-          <Ionicons name="arrow-back" size={20} color="#334155" />
-          <Text style={styles.bottomBtnLabel}>Back</Text>
+        <Pressable onPress={openExternal} style={styles.bottomButton}>
+          <Ionicons name="share-outline" size={22} color="#2C3E50" />
+          <Text style={styles.bottomButtonLabel}>Share</Text>
         </Pressable>
-
-        <Pressable onPress={() => webviewRef.current?.goForward?.()} style={styles.bottomBtn}>
-          <Ionicons name="arrow-forward" size={20} color="#334155" />
-          <Text style={styles.bottomBtnLabel}>Forward</Text>
+        
+        <Pressable onPress={() => addTab()} style={styles.bottomButton}>
+          <Ionicons name="add" size={24} color="#2C3E50" />
+          <Text style={styles.bottomButtonLabel}>New Tab</Text>
         </Pressable>
-
-        <Pressable onPress={openExternal} style={[styles.bottomBtn, styles.primaryAction]}>
-          <Ionicons name="open" size={18} color="#fff" />
-          <Text style={[styles.bottomBtnLabel, styles.primaryActionLabel]}>Open</Text>
-        </Pressable>
-
-        <Pressable onPress={() => addTab()} style={[styles.bottomBtn, styles.primaryAction, { marginLeft: 8 }]}>
-          <Ionicons name="add" size={18} color="#fff" />
-          <Text style={[styles.bottomBtnLabel, styles.primaryActionLabel]}>New</Text>
+        
+        <Pressable onPress={() => {}} style={styles.bottomButton}>
+          <Ionicons name="ellipsis-horizontal" size={22} color="#2C3E50" />
+          <Text style={styles.bottomButtonLabel}>More</Text>
         </Pressable>
       </View>
     </View>
@@ -321,112 +468,184 @@ export default function BrowserScreen({ route }: any) {
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#f6fbff' },
-
-  topCardWrap: { paddingHorizontal: 12, paddingBottom: 6 },
-  addressCard: {
+  container: { 
+    flex: 1, 
+    backgroundColor: '#FFFFFF' 
+  },
+  
+  topBar: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: '#fff',
-    borderRadius: 14,
-    paddingVertical: 8,
-    paddingHorizontal: 10,
-    ...Platform.select({
-      ios: { shadowColor: '#000', shadowOpacity: 0.04, shadowRadius: 6, shadowOffset: { width: 0, height: 4 } },
-      android: { elevation: 2 },
-    }),
-  },
-  favicon: {
-    width: 44,
-    height: 44,
-    borderRadius: 10,
-    backgroundColor: '#EEF2FF',
-    alignItems: 'center',
-    justifyContent: 'center',
-    marginRight: 10,
-  },
-  faviconText: { color: '#334155', fontWeight: '700' },
-
-  addressInputWrap: { flex: 1 },
-  addressLabel: { fontSize: 11, color: '#6b7280' },
-  addressInput: { fontSize: 16, paddingVertical: 6, color: '#081226' },
-
-  addressActions: { marginLeft: 8, flexDirection: 'row', alignItems: 'center' },
-  iconAction: { padding: 6, marginLeft: 4 },
-
-  metaRow: { flexDirection: 'row', justifyContent: 'space-between', marginTop: 8, paddingHorizontal: 4 },
-  metaLeft: { fontSize: 12, color: '#94a3b8' },
-  metaRight: { fontSize: 12, color: '#94a3b8' },
-
-  tabStripWrap: { paddingTop: 6, paddingBottom: 6 },
-  tabList: { paddingHorizontal: 12, alignItems: 'center' },
-  tabPill: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: '#EEF2FF',
     paddingHorizontal: 12,
     paddingVertical: 8,
-    borderRadius: 12,
+    backgroundColor: '#FFFFFF',
+    borderBottomWidth: 1,
+    borderBottomColor: '#ECF0F1'
+  },
+  
+  navButtons: {
+    flexDirection: 'row',
     marginRight: 8,
-    minWidth: 110,
   },
-  tabPillActive: {
-    backgroundColor: '#DBEEFF',
-    borderColor: '#0a84ff',
-    borderWidth: 1,
+  
+  navButton: {
+    padding: 6,
+    marginRight: 4,
+    borderRadius: 4,
   },
-  tabPillText: { fontSize: 13, color: '#334155', flexShrink: 1 },
-  tabPillTextActive: { color: '#0747A6', fontWeight: '700' },
-  tabCloseBtn: { marginLeft: 8, padding: 6 },
-
-  tabAddBtn: {
-    backgroundColor: '#0a84ff',
-    paddingHorizontal: 12,
-    paddingVertical: 9,
-    borderRadius: 12,
+  
+  disabledButton: {
+    opacity: 0.5,
+  },
+  
+  addressContainer: {
+    flex: 1,
+    flexDirection: 'row',
     alignItems: 'center',
-    justifyContent: 'center',
+    backgroundColor: '#F8F9FA',
+    borderRadius: 8,
+    paddingHorizontal: 8,
+    paddingVertical: 6,
+    marginHorizontal: 8,
   },
-
+  
+  securityIndicator: {
+    marginRight: 6,
+  },
+  
+  addressInput: {
+    flex: 1,
+    fontSize: 15,
+    color: '#2C3E50',
+    paddingVertical: 2,
+  },
+  
+  loadingIndicator: {
+    marginLeft: 6,
+  },
+  
+  externalButton: {
+    padding: 4,
+  },
+  
+  addTabButton: {
+    padding: 4,
+    marginLeft: 4,
+  },
+  
+  tabStrip: {
+    borderBottomWidth: 1,
+    borderBottomColor: '#ECF0F1',
+    backgroundColor: '#FFFFFF',
+  },
+  
+  tabList: {
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+  },
+  
+  tab: {
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 6,
+    backgroundColor: '#F8F9FA',
+    marginRight: 8,
+    minWidth: 100,
+    maxWidth: 200,
+  },
+  
+  activeTab: {
+    backgroundColor: '#E8F4FD',
+    borderWidth: 1,
+    borderColor: '#3498DB',
+  },
+  
+  tabContent: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  
+  tabTitle: {
+    fontSize: 13,
+    color: '#7F8C8D',
+    flex: 1,
+    marginRight: 6,
+  },
+  
+  activeTabTitle: {
+    color: '#2C3E50',
+    fontWeight: '600',
+  },
+  
+  tabCloseButton: {
+    padding: 2,
+  },
+  
   webviewContainer: {
     flex: 1,
-    marginHorizontal: 12,
-    marginBottom: 8,
-    borderRadius: 12,
-    overflow: 'hidden',
-    backgroundColor: '#fff',
-    ...Platform.select({
-      ios: { shadowColor: '#000', shadowOpacity: 0.03, shadowRadius: 8, shadowOffset: { width: 0, height: 6 } },
-      android: { elevation: 1 },
-    }),
+    backgroundColor: '#FFFFFF',
   },
-  webview: { flex: 1, backgroundColor: '#fff' },
-
+  
+  webview: { 
+    flex: 1, 
+    backgroundColor: '#FFFFFF' 
+  },
+  
+  progressBar: {
+    height: 2,
+    backgroundColor: '#3498DB',
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    zIndex: 40,
+  },
+  
   loadingOverlay: {
     position: 'absolute',
     zIndex: 30,
-    left: 16,
-    right: 16,
-    top: 16,
-    borderRadius: 10,
-    backgroundColor: 'rgba(255,255,255,0.95)',
-    padding: 12,
+    left: 0,
+    right: 0,
+    top: 0,
+    bottom: 0,
+    justifyContent: 'center',
     alignItems: 'center',
+    backgroundColor: 'rgba(255, 255, 255, 0.8)',
   },
-  loadingText: { marginTop: 8, color: '#0a84ff', fontWeight: '600' },
-
+  
+  loadingText: { 
+    marginTop: 8, 
+    color: '#3498DB', 
+    fontSize: 14 
+  },
+  
   bottomBar: {
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    borderTopWidth: 1,
-    borderTopColor: '#eef2ff',
-    backgroundColor: '#fff',
     flexDirection: 'row',
+    justifyContent: 'space-around',
     alignItems: 'center',
+    paddingVertical: 12,
+    borderTopWidth: 1,
+    borderTopColor: '#ECF0F1',
+    backgroundColor: '#FFFFFF',
   },
-  bottomBtn: { alignItems: 'center', justifyContent: 'center', paddingHorizontal: 8, paddingVertical: 6, flexDirection: 'row' },
-  bottomBtnLabel: { marginLeft: 6, fontSize: 13, color: '#334155' },
+  
+  bottomButton: {
+    alignItems: 'center',
+    paddingHorizontal: 16,
+  },
+  
+  bottomButtonLabel: {
+    fontSize: 12,
+    color: '#7F8C8D',
+    marginTop: 4,
+  },
 
-  primaryAction: { backgroundColor: '#0a84ff', paddingHorizontal: 14, paddingVertical: 10, borderRadius: 12 },
-  primaryActionLabel: { color: '#fff', fontWeight: '700' },
+  topCardWrap: {
+  paddingHorizontal: 12,
+  paddingVertical: 6,
+  backgroundColor: '#F9FAFB', // soft iOS-like gray background
+  borderBottomWidth: 1,
+  borderBottomColor: '#E5E7EB', // subtle divider
+},
+
 });

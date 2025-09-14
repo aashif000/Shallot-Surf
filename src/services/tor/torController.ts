@@ -1,27 +1,27 @@
-// src/services/tor/torController.ts
 import { ORBOT_PLAY_STORE, TOR_CHECK_URL } from '@/config/env';
-import { Alert, Linking, Platform } from 'react-native';
-
-// NOTE: This file is intentionally JS-only.
-// Real programmatic control of Orbot/tor requires a native bridge (Kotlin) later.
-// These helpers are safe to use in Expo Go for detection and guidance.
+import { Alert, Linking, NativeEventEmitter, NativeModules, Platform } from 'react-native';
 
 const ORBOT_PACKAGE = 'org.torproject.android';
 const ORBOT_URI = `${ORBOT_PACKAGE}://`;
 
-/** canOpenOrbotUri - performs Linking.canOpenURL for Orbot URI */
+const { TorModule } = NativeModules; // Native Kotlin module
+
+/* ---------------------------------------------------------------------------
+ * JS-only fallbacks (safe in Expo, non-native builds)
+ * -------------------------------------------------------------------------*/
+
+/** Check if Orbot is installed */
 export async function isOrbotInstalled(): Promise<boolean> {
   if (Platform.OS !== 'android') return false;
   try {
-    // On Android 11+, package visibility may hide the result unless <queries> is present in manifest.
     return await Linking.canOpenURL(ORBOT_URI);
-  } catch (e) {
+  } catch {
     return false;
   }
 }
 
-/** openOrbotApp - open Orbot if installed, otherwise open Play Store */
-export async function openOrbotApp() {
+/** Open Orbot app or fallback to Play Store */
+export async function openOrbotApp(): Promise<boolean> {
   try {
     const can = await isOrbotInstalled();
     if (can) {
@@ -38,7 +38,7 @@ export async function openOrbotApp() {
       );
       return false;
     }
-  } catch (e) {
+  } catch {
     try {
       Linking.openURL(ORBOT_PLAY_STORE);
     } catch {
@@ -48,11 +48,7 @@ export async function openOrbotApp() {
   }
 }
 
-/**
- * checkTorConnectivity
- * - Attempts to fetch the Tor check page. This will only indicate Tor routing
- *   if the device/app is actually routed through Tor (e.g., Orbot VPN mode enabled).
- */
+/** Fetch Tor check URL to verify connectivity */
 export async function checkTorConnectivity(timeoutMs = 10000): Promise<{ ok: boolean; text?: string }> {
   try {
     const controller = new AbortController();
@@ -67,11 +63,81 @@ export async function checkTorConnectivity(timeoutMs = 10000): Promise<{ ok: boo
   }
 }
 
-/**
- * Note: later native features you may want to add:
- * - programmatic start/stop of Orbot
- * - query Orbot status and torified apps
- * - fetch Orbot local proxy ports
- *
- * When ready, create an android-native-module/tor-module and expose methods via React Native bridge.
- */
+/* ---------------------------------------------------------------------------
+ * Native TorModule integration
+ * -------------------------------------------------------------------------*/
+
+const torEventEmitter = new NativeEventEmitter(TorModule);
+
+export const subscribeTorStatus = (callback: (status: string) => void) => {
+  const subscription = torEventEmitter.addListener('TorStatus', callback);
+  return () => subscription.remove();
+};
+
+export const isTorRunning = async (): Promise<boolean> => {
+  if (Platform.OS !== 'android' || !TorModule?.getStatus) return false;
+  try {
+    const status: string = await TorModule.getStatus();
+    return status === 'connected' || status === 'running';
+  } catch (e) {
+    console.error('Tor status check failed:', e);
+    return false;
+  }
+};
+
+export const startTor = async (): Promise<void> => {
+  if (Platform.OS !== 'android') {
+    await openOrbotApp();
+    return;
+  }
+
+  if (TorModule?.startTor) {
+    try {
+      await TorModule.startTor();
+      console.log('Tor started');
+    } catch (e) {
+      console.error('Failed to start Tor:', e);
+    }
+  } else {
+    await openOrbotApp();
+  }
+};
+
+export const stopTor = async (): Promise<void> => {
+  if (Platform.OS !== 'android' || !TorModule?.stopTor) return;
+  try {
+    await TorModule.stopTor();
+    console.log('Tor stopped');
+  } catch (e) {
+    console.error('Failed to stop Tor:', e);
+  }
+};
+
+/* ---------------------------------------------------------------------------
+ * Unified torController API
+ * -------------------------------------------------------------------------*/
+
+export type TorStatus = 'stopped' | 'starting' | 'running' | 'error' | 'unknown';
+
+export const torController = {
+  async getStatus(): Promise<TorStatus> {
+    if (TorModule?.getStatus) return TorModule.getStatus();
+    return 'unknown';
+  },
+  async start(): Promise<void> {
+    await startTor();
+  },
+  async stop(): Promise<void> {
+    await stopTor();
+  },
+  async setBridges(bridges: string[]): Promise<void> {
+    if (TorModule?.setBridges) return TorModule.setBridges(bridges);
+    // fallback: not implemented
+  },
+  async enableBridges(enable = true): Promise<void> {
+    if (TorModule?.enableBridges) return TorModule.enableBridges(enable);
+    // fallback: not implemented
+  },
+};
+
+export default torController;
